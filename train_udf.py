@@ -5,8 +5,10 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import yaml
 
-from data.processed_dataset import VGGTProcessedDataset
+from preprocess_dataset import VGGTProcessedDataset
 from losses import chamfer_loss, depth_loss, feature_alignment_loss, track_loss
 from models.udf import FeatureHead, UDF, volume_render_rays
 
@@ -56,6 +58,8 @@ def sample_pixels(confidence: torch.Tensor, num_samples: int) -> Tuple[torch.Ten
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    writer = SummaryWriter(log_dir=args.log_dir)
+
     dataset = VGGTProcessedDataset(args.data_root)
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
     sample_item = dataset[0]
@@ -113,6 +117,21 @@ def train(args: argparse.Namespace) -> None:
             loss_tr = track_loss(udf_vals)
             loss = loss + args.w_track * loss_tr
 
+        writer.add_scalar("loss/total", loss.item(), step)
+        if args.w_depth > 0:
+            writer.add_scalar("loss/depth", loss_d.item(), step)
+        if args.w_pc > 0:
+            writer.add_scalar("loss/pc", loss_pc.item(), step)
+        if feat_head is not None and args.w_feat > 0:
+            writer.add_scalar("loss/feat", loss_feat.item(), step)
+        if "tracks" in batch and args.w_track > 0:
+            writer.add_scalar("loss/track", loss_tr.item(), step)
+
+        if step % 100 == 0:
+            writer.add_image("depth/gt", (depth / depth.max()).unsqueeze(0), step)
+            writer.add_mesh("pointcloud/pred", vertices=pred_points.unsqueeze(0), global_step=step)
+            writer.add_mesh("pointcloud/gt", vertices=gt_point.unsqueeze(0), global_step=step)
+
         optim.zero_grad()
         loss.backward()
         optim.step()
@@ -124,9 +143,12 @@ def train(args: argparse.Namespace) -> None:
         if step + 1 >= args.max_steps:
             break
 
+    writer.close()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train UDF model from VGGT processed data")
+    parser.add_argument("--config", type=str, help="Path to YAML config file", default=None)
     parser.add_argument("--data-root", type=str, default="processed_data")
     parser.add_argument("--rays-per-step", type=int, default=1024)
     parser.add_argument("--samples-per-ray", type=int, default=64)
@@ -139,5 +161,14 @@ if __name__ == "__main__":
     parser.add_argument("--w-feat", type=float, default=0.5)
     parser.add_argument("--w-track", type=float, default=0.1)
     parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--log-dir", type=str, default="runs/udf")
     args = parser.parse_args()
+
+    if args.config:
+        with open(args.config, "r") as f:
+            cfg = yaml.safe_load(f)
+        for k, v in cfg.items():
+            if hasattr(args, k):
+                setattr(args, k, v)
+
     train(args)
